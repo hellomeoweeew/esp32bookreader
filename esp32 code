@@ -1,0 +1,254 @@
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <EEPROM.h>
+#include "FontMaker.h"
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// === Cấu hình WiFi ===
+const char* ssid = "";//tên wifi
+const char* password = "";//mật khẩu
+
+// === Địa chỉ trang web bạn muốn truy cập ===
+int chapnumber = 0;
+const char* url = "https://raw.githubusercontent.com/hellomeoweeew/esp32bookreader/da77f50e6833787d20198380ebad079b491e52bd/database/dauphathuongkhung/dauphathuongkhung%20(chapnumber).html";
+//đây là url ví dụ, có thể thay bằng cái gì đó khác
+// ========== TFT pins ==========
+#define TFT_CS     5
+#define TFT_DC     2
+#define TFT_RST    4
+#define bt_up 12     // lên
+#define bt_down 13    // xuống
+#define bt_left 14   // trái
+#define bt_right 27  // phải
+#define bt_enter 32 // enter,nhập
+#define bt_back 33  // quay lại
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+// ========== Font ==========
+FontMaker myfont;
+extern const uint8_t tv1[];  // Font tiếng Việt tự tạo(tôi không đẩy lên đây đâu,:>)
+#define FONT_WIDTH  8
+#define FONT_HEIGHT 11
+
+// ========== Giao diện ==========
+#define SCREEN_W 160
+#define SCREEN_H 128
+#define MARGIN 0
+
+// ========== Biến toàn cục ==========
+File file;
+int chap_units = 0;
+int chap_tens = 0;
+int chap_hundreds = 0;
+String currentContent = "";
+int scrollY = 0;
+
+//============màn hình chọn chương================
+void drawChapterInput() {
+  tft.fillScreen(ST77XX_BLACK);
+  myfont.set_font(tv1);
+
+  int x = 30;  // vị trí bắt đầu vẽ số
+
+  myfont.drawChar(x,      50, '0' + chap_thousands, selected_digit == 0 ? ST77XX_RED : ST77XX_WHITE);
+  myfont.drawChar(x + 15, 50, '0' + chap_hundreds,  selected_digit == 1 ? ST77XX_RED : ST77XX_WHITE);
+  myfont.drawChar(x + 30, 50, '0' + chap_tens,      selected_digit == 2 ? ST77XX_RED : ST77XX_WHITE);
+  myfont.drawChar(x + 45, 50, '0' + chap_units,     selected_digit == 3 ? ST77XX_RED : ST77XX_WHITE);
+}
+
+
+//==========chọn chương===============
+#define BTN_LEFT   bt_left
+#define BTN_RIGHT  bt_right
+#define BTN_UP     bt_up
+#define BTN_DOWN   bt_down
+#define BTN_ENTER  bt_enter
+
+int chap_thousands = 0;
+int chap_hundreds = 0;
+int chap_tens = 0;
+int chap_units = 0;
+
+int selected_digit = 0; // 0 = hàng nghìn, 1 = trăm, 2 = chục, 3 = đơn vị
+
+void ChapterSelection() {
+  pinMode(BTN_LEFT, INPUT_PULLUP);
+  pinMode(BTN_RIGHT, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+  pinMode(BTN_ENTER, INPUT_PULLUP);
+
+  drawChapterInput();
+
+  while (true) {
+    if (digitalRead(BTN_LEFT) == LOW) {
+      selected_digit = (selected_digit + 3) % 4;
+      drawChapterInput();
+      delay(200);
+    }
+
+    if (digitalRead(BTN_RIGHT) == LOW) {
+      selected_digit = (selected_digit + 1) % 4;
+      drawChapterInput();
+      delay(200);
+    }
+
+    if (digitalRead(BTN_UP) == LOW) {
+      if (selected_digit == 0) chap_thousands = (chap_thousands + 1) % 10;
+      else if (selected_digit == 1) chap_hundreds = (chap_hundreds + 1) % 10;
+      else if (selected_digit == 2) chap_tens = (chap_tens + 1) % 10;
+      else chap_units = (chap_units + 1) % 10;
+      drawChapterInput();
+      delay(200);
+    }
+
+    if (digitalRead(BTN_DOWN) == LOW) {
+      if (selected_digit == 0) chap_thousands = (chap_thousands + 9) % 10;
+      else if (selected_digit == 1) chap_hundreds = (chap_hundreds + 9) % 10;
+      else if (selected_digit == 2) chap_tens = (chap_tens + 9) % 10;
+      else chap_units = (chap_units + 9) % 10;
+      drawChapterInput();
+      delay(200);
+    }
+
+    if (digitalRead(BTN_ENTER) == LOW) {
+      chapnumber = chap_thousands * 1000 + chap_hundreds * 100 + chap_tens * 10 + chap_units;
+      Serial.print("Chương đã chọn: "); Serial.println(chapnumber);
+      delay(300);
+      break;
+    }
+  }
+}
+//==============lấy url==========
+String getChapterURL(int chapnumber) {
+  // Chuyển số chương thành chuỗi
+  return "https://raw.githubusercontent.com/hellomeoweeew/esp32bookreader/da77f50e6833787d20198380ebad079b491e52bd/database/dauphathuongkhung/dauphathuongkhung (" + String(chapnumber) + ").html";
+}
+
+//==========truy cập url=========
+String fetchChapterContent(int chapnumber) {
+  String url = getChapterURL(chapnumber);
+
+  HTTPClient http;
+  http.begin(url);
+  int httpCode = http.GET();
+
+  if (httpCode == 200) {
+    return http.getString();  // Nội dung file html
+  } else {
+    Serial.println("Tải thất bại: " + String(httpCode));
+    return "";
+  }
+}
+
+//============word warp(tôi dùng font đặc biệt)============
+void drawScrolledText(const String& text, int scrollOffsetY) {
+  tft.fillScreen(ST77XX_BLACK);
+  myfont.set_font(tv1);
+
+  int x = MARGIN;
+  int y = MARGIN - scrollOffsetY;
+
+  String line = "";
+
+  for (size_t i = 0; i < text.length(); ++i) {
+    char c = text[i];
+
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (y >= MARGIN && y + FONT_HEIGHT <= SCREEN_H - MARGIN)
+        myfont.drawStr(MARGIN, y, line.c_str(), ST77XX_WHITE);
+
+      line = "";
+      y += FONT_HEIGHT;
+      x = MARGIN;
+      continue;
+    }
+
+    String nextChar = String(c);
+    int w = myfont.getLength(nextChar.c_str());
+
+    if (x + w > SCREEN_W - MARGIN) {
+      if (y >= MARGIN && y + FONT_HEIGHT <= SCREEN_H - MARGIN)
+        myfont.drawStr(MARGIN, y, line.c_str(), ST77XX_WHITE);
+
+      line = nextChar;
+      x = MARGIN + w;
+      y += FONT_HEIGHT;
+    } else {
+      line += c;
+      x += w;
+    }
+
+    if (y > SCREEN_H) break;  // vượt màn hình thì dừng
+  }
+
+  if (line.length() && y >= MARGIN && y + FONT_HEIGHT <= SCREEN_H - MARGIN) {
+    myfont.drawStr(MARGIN, y, line.c_str(), ST77XX_WHITE);
+  }
+}
+
+//==========set up=============
+void setup() {
+  Serial.begin(115200);
+
+  // Khởi tạo TFT
+  tft.initR(INITR_BLACKTAB);
+  tft.setRotation(3);
+  tft.fillScreen(ST77XX_BLACK);
+  myfont.set_font(tv1);
+  pinMode(bt_up, INPUT_PULLUP);
+  pinMode(bt_down, INPUT_PULLUP);
+  pinMode(bt_back, INPUT_PULLUP);
+  pinMode(bt_left, INPUT_PULLUP);
+  pinMode(bt_right, INPUT_PULLUP);
+  pinMode(bt_enter, INPUT_PULLUP);
+
+  // Kết nối WiFi
+  WiFi.begin(ssid, password);
+  tft.setCursor(0, 0);
+  myfont.drawStr(0, 20, "Dang ket noi WiFi...", ST77XX_WHITE);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("WiFi connected");
+  tft.fillScreen(ST77XX_BLACK);
+  myfont.drawStr(0, 20, "Da ket noi WiFi!", ST77XX_GREEN);
+  delay(1000); // cho người dùng nhìn thấy thông báo
+}
+
+//==========loop============
+void loop() {
+  ChapterSelection();
+
+  currentContent = fetchChapterContent(chapnumber);
+  scrollY = 0;
+  drawScrolledText(currentContent, scrollY);
+
+  while (true) {
+    if (digitalRead(bt_down) == LOW) {
+      scrollY += FONT_HEIGHT;
+      drawScrolledText(currentContent, scrollY);
+      delay(200);
+    }
+
+    if (digitalRead(bt_up) == LOW) {
+      scrollY -= FONT_HEIGHT;
+      if (scrollY < 0) scrollY = 0;
+      drawScrolledText(currentContent, scrollY);
+      delay(200);
+    }
+
+    if (digitalRead(bt_back) == LOW) {
+      delay(300);
+      tft.fillScreen(ST77XX_BLACK);
+      break;  // quay lại chọn chương
+    }
+  }
+}
+
